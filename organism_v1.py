@@ -3,6 +3,11 @@
 #   Nathan A. Rooy
 #   Evolving Simple Organisms
 #   2017-Nov.
+#   
+#   Modified by:
+#   A. Clelia Bertelli
+#   Evolution But In PyTorch
+#   2024-Aug.
 #
 #------------------------------------------------------------------------------+
 
@@ -12,14 +17,12 @@ from __future__ import division, print_function
 from collections import defaultdict
 
 from matplotlib import pyplot as plt
-from matplotlib.patches import Circle
-import matplotlib.lines as lines
 
 from plotting import plot_food
 from plotting import plot_organism
 
-import numpy as np
 import operator
+import torch
 
 from math import atan2
 from math import cos
@@ -40,13 +43,13 @@ settings = {}
 # EVOLUTION SETTINGS
 settings['pop_size'] = 50       # number of organisms
 settings['food_num'] = 100      # number of food particles
-settings['gens'] = 50           # number of generations
+settings['gens'] = 10           # number of generations
 settings['elitism'] = 0.20      # elitism (selection bias)
 settings['mutate'] = 0.10       # mutation rate
 
 # SIMULATION SETTINGS
-settings['gen_time'] = 100      # generation length         (seconds)
-settings['dt'] = 0.04           # simulation time step      (dt)
+settings['gen_time'] = 10     # generation length         (seconds)
+settings['dt'] = 0.1           # simulation time step      (dt)
 settings['dr_max'] = 720        # max rotational speed      (degrees per second)
 settings['v_max'] = 0.5         # max velocity              (units per second)
 settings['dv_max'] =  0.25      # max acceleration (+/-)    (units per second^2)
@@ -56,18 +59,20 @@ settings['x_max'] =  2.0        # arena eastern border
 settings['y_min'] = -2.0        # arena southern border
 settings['y_max'] =  2.0        # arena northern border
 
-settings['plot'] = False        # plot final generation?
+settings['plot'] = True        # plot final generation?
 
 # ORGANISM NEURAL NET SETTINGS
 settings['inodes'] = 1          # number of input nodes
-settings['hnodes'] = 5          # number of hidden nodes
+settings['hnodes'] = 256          # number of hidden nodes
 settings['onodes'] = 2          # number of output nodes
 
 #--- FUNCTIONS ----------------------------------------------------------------+
 
+def add_weights(x, weights):
+    return torch.mul(x, weights)
+
 def dist(x1,y1,x2,y2):
     return sqrt((x2-x1)**2 + (y2-y1)**2)
-
 
 def calc_heading(org, food):
     d_x = food.x - org.x
@@ -156,14 +161,14 @@ def evolve(settings, organisms_old, gen):
             # MUTATE: WIH WEIGHTS
             if mat_pick == 0:
                 index_row = randint(0,settings['hnodes']-1)
-                wih_new[index_row] = wih_new[index_row] * uniform(0.9, 1.1)
-                if wih_new[index_row] >  1: wih_new[index_row] = 1
-                if wih_new[index_row] < -1: wih_new[index_row] = -1
+                wih_new[0][index_row] = wih_new[0][index_row] * uniform(0.9, 1.1)
+                if wih_new[0][index_row] >  1: wih_new[0][index_row] = 1
+                if wih_new[0][index_row] < -1: wih_new[0][index_row] = -1
 
             # MUTATE: WHO WEIGHTS
             if mat_pick == 1:
-                index_row = randint(0,settings['onodes']-1)
-                index_col = randint(0,settings['hnodes']-1)
+                index_row = randint(0,settings['hnodes']-1)
+                index_col = randint(0,settings['hnodes']+ settings['inodes']-4)
                 who_new[index_row][index_col] = who_new[index_row][index_col] * uniform(0.9, 1.1)
                 if who_new[index_row][index_col] >  1: who_new[index_row][index_col] = 1
                 if who_new[index_row][index_col] < -1: who_new[index_row][index_col] = -1
@@ -225,6 +230,13 @@ def simulate(settings, organisms, foods, gen):
 
 #--- CLASSES ------------------------------------------------------------------+
 
+class Lambda(torch.nn.Module):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+
+    def forward(self, *args):
+        return self.func(*args)
 
 class food():
     def __init__(self, settings):
@@ -258,18 +270,26 @@ class organism():
 
         self.name = name
 
+        self.inodes = settings["inodes"]
+        self.hnodes = settings["hnodes"]
+        self.onodes = settings["onodes"]
 
     # NEURAL NETWORK
     def think(self):
 
-        # SIMPLE MLP
-        af = lambda x: np.tanh(x)               # activation function
-        h1 = af(np.dot(self.wih, self.r_food))  # hidden layer
-        out = af(np.dot(self.who, h1))          # output layer
-
+        net = torch.nn.Sequential(
+            torch.nn.Conv1d(self.inodes, self.hnodes, kernel_size=3),
+            torch.nn.Tanh(),
+            Lambda(lambda x: add_weights(x, self.who)), 
+            torch.nn.Conv1d(self.hnodes, self.onodes, kernel_size=3),
+            torch.nn.Tanh(),
+            torch.nn.AdaptiveAvgPool1d(1)
+        )
+        innet = self.wih * torch.tensor(self.r_food)
+        out = net(self.wih)
         # UPDATE dv AND dr WITH MLP RESPONSE
-        self.nn_dv = float(out[0])   # [-1, 1]  (accelerate=1, deaccelerate=-1)
-        self.nn_dr = float(out[1])   # [-1, 1]  (left=1, right=-1)
+        self.nn_dv = float(out[0].item())   # [-1, 1]  (accelerate=1, deaccelerate=-1)
+        self.nn_dr = float(out[1].item())   # [-1, 1]  (left=1, right=-1)
 
 
     # UPDATE HEADING
@@ -306,8 +326,8 @@ def run(settings):
     #--- POPULATE THE ENVIRONMENT WITH ORGANISMS ----------+
     organisms = []
     for i in range(0,settings['pop_size']):
-        wih_init = np.random.uniform(-1, 1, (settings['hnodes'], settings['inodes']))     # mlp weights (input -> hidden)
-        who_init = np.random.uniform(-1, 1, (settings['onodes'], settings['hnodes']))     # mlp weights (hidden -> output)
+        wih_init = torch.rand(settings['inodes'], settings['hnodes']) * 2 - 1    # mlp weights (input -> hidden)
+        who_init = torch.rand(settings['hnodes'], settings['hnodes']+ settings['inodes']-3)     # mlp weights (hidden -> output)
 
         organisms.append(organism(settings, wih_init, who_init, name='gen[x]-org['+str(i)+']'))
 
